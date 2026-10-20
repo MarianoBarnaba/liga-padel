@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Liga de Pádel</title>
-<meta name="description" content="Liga de pádel por categorías: 8va, 6ta y Libre. Damas, hombres y mixto. Inscribí a tu pareja.">
+<meta name="description" content="Liga de pádel por categorías: 8va y 6ta. Damas, hombres y mixto. Inscribí a tu pareja.">
 <meta property="og:title" content="Liga de Pádel · Inscripciones abiertas">
 <meta property="og:description" content="Liga por categorías, todos contra todos y playoff final. Inscribí a tu pareja.">
 <meta property="og:type" content="website">
@@ -657,8 +657,7 @@ function render(){
 /* ============ Portada (landing) ============ */
 const CATEGORIAS = [
   { n:'8va', d:'Para quienes están empezando a competir o juegan hace poco.' },
-  { n:'6ta', d:'Nivel intermedio: parejas con experiencia en torneos.' },
-  { n:'Libre', d:'Abierta a todos los niveles. Para los que vienen a dar pelea.' }
+  { n:'6ta', d:'Nivel intermedio: parejas con experiencia en torneos.' }
 ];
 function regBtn(cls, label){
   if (!state.regOpen || !state.formUrl) return '';
@@ -686,7 +685,7 @@ function renderLanding(){
         <a class="btn ghost lg" href="#/torneos">Ver torneos y resultados</a>
       </div>
       <div class="hero-facts">
-        <div><b>3</b><span>categorías</span></div>
+        <div><b>2</b><span>categorías</span></div>
         <div><b>Todos</b><span>contra todos</span></div>
         <div><b>Playoff</b><span>final</span></div>
       </div>
