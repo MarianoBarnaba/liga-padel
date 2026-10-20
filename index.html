@@ -248,6 +248,12 @@ details.site[open] summary{border-bottom:1px solid var(--line)}
 #toast.bad{background:var(--danger);color:#fff}
 footer{max-width:1100px;margin:0 auto;padding:0 16px 32px;font-size:13px;color:var(--muted)}
 
+/* Ingreso admin */
+.login-wrap{display:grid;place-items:center;min-height:55vh}
+.login{width:100%;max-width:400px}
+.login h1{font-size:32px}
+.banner.bad{background:var(--danger);color:#fff}
+
 /* Visibilidad admin / portada */
 body:not(.admin-device) .admin-only{display:none !important}
 .nav-cta{display:inline-flex;align-items:center;font-weight:700;font-size:14px;padding:7px 14px;border-radius:8px;background:var(--accent);color:var(--accent-ink);text-decoration:none;white-space:nowrap}
@@ -427,15 +433,33 @@ html:fullscreen .tv-fs, body.hide-cursor .tv-fs{opacity:0;pointer-events:none}
     </div>
   </div>
 </header>
-<div class="banner admin-only">Maqueta local · los datos se guardan solo en este navegador</div>
+<div class="banner admin-only" id="banner"></div>
 <main id="app"></main>
 <footer id="site-footer"></footer>
 <div id="modal-root"></div>
 <div id="toast" role="status" aria-live="polite"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
+/* ============ Conexión con Supabase ============ */
+// La clave "anon" es pública por diseño: lo que se puede leer o escribir lo controlan
+// las reglas de seguridad (RLS) de la base. Solo los usuarios de la tabla "admins" pueden escribir.
+const SUPABASE_URL = 'https://axnnwnsxfnyvvdrikidd.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF4bm53bnN4Zm55dnZkcmlraWRkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1MDkyNTEsImV4cCI6MjEwODA4NTI1MX0.Zt5Kcuds08U9_Z8_o_JjyBRVbzRM0Ap1iIsSXsuy0SQ';
+let sb = null;
+try{
+  if (window.supabase && SUPABASE_URL && SUPABASE_KEY && location.protocol !== 'file:')
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth:{ persistSession:true, autoRefreshToken:true } });
+}catch(e){ sb = null; }
+// Para probar el archivo local contra la base real: abrirlo con ?online
+if (!sb && window.supabase && /[?&]online\b/.test(location.search)){
+  try{ sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY); }catch(e){}
+}
+const ONLINE = !!sb;
+
 /* ============ Estado y almacenamiento ============ */
-const LS_KEY = 'padel-liga-v1';
+// En línea, el navegador guarda solo una copia para mostrar rápido; la fuente de verdad es Supabase.
+const LS_KEY = ONLINE ? 'padel-liga-cache-v2' : 'padel-liga-v1';
 const app = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
 let state = load();
@@ -447,17 +471,165 @@ function load(){
   }catch(e){}
   return { siteName:'Liga de Pádel', admin:false, tournaments:[] };
 }
-// Hasta tener login real (Supabase), el panel de admin solo aparece en los navegadores
-// donde se entró una vez a #/admin. Así la web publicada no muestra el modo admin al público.
+// Admin: en línea, se entra con usuario y contraseña (Supabase Auth) y el usuario tiene que estar
+// en la tabla "admins". Sin conexión (archivo local), basta con entrar una vez a #/admin.
 const ADMIN_KEY = 'padel-admin-device';
 let adminDevice = false;
-try{ adminDevice = localStorage.getItem(ADMIN_KEY) === '1'; }catch(e){}
+let adminEmail = '';
+if (!ONLINE){ try{ adminDevice = localStorage.getItem(ADMIN_KEY) === '1'; }catch(e){} }
 if (!adminDevice) state.admin = false;
 const DEFAULT_FORM = 'https://forms.gle/Hyw5Gu2KC9gSq5uz7';
 if (state.formUrl === undefined) state.formUrl = DEFAULT_FORM;
 if (state.tagline === undefined) state.tagline = 'Liga por categorías: todos contra todos y playoff final. Armá tu pareja y anotate.';
 if (state.regOpen === undefined) state.regOpen = true;
-function save(){ try{ const raw = JSON.stringify(state); localStorage.setItem(LS_KEY, raw); lastRaw = raw; }catch(e){} }
+function save(){
+  try{ const raw = JSON.stringify(state); localStorage.setItem(LS_KEY, raw); lastRaw = raw; }catch(e){}
+  if (ONLINE && adminDevice) queueSync();
+}
+
+/* ============ Sincronización con la base ============ */
+// Cada cosa es un "documento": 'site' (ajustes), 'live' (marcador) y 't:<id>' (un torneo cada uno).
+// Guardar = subir solo los documentos que cambiaron. Así el veedor y el admin pueden trabajar
+// a la vez sin pisarse (salvo que editen el mismo torneo en el mismo momento).
+const synced = {};          // id -> JSON que tiene el servidor
+const sentRecent = {};      // id -> últimos JSON enviados por este navegador (para ignorar el eco)
+let syncChain = Promise.resolve(), syncQueued = false, syncFailed = false;
+let remoteLoaded = false;
+
+// Postgres (jsonb) reordena las claves de los objetos, así que para comparar
+// usamos un JSON "canónico" con las claves ordenadas.
+function canon(v){
+  if (Array.isArray(v)) return '[' + v.map(x => x === undefined ? 'null' : canon(x)).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
+  return JSON.stringify(v === undefined ? null : v);
+}
+function toDocs(st){
+  const d = { site: { siteName:st.siteName, tagline:st.tagline, formUrl:st.formUrl, regOpen:!!st.regOpen }, live: st.live || {} };
+  (st.tournaments || []).forEach(t => d['t:' + t.id] = t);
+  const out = {}; Object.keys(d).forEach(k => out[k] = canon(d[k]));
+  return out;
+}
+function applyDoc(id, data){
+  if (id === 'site'){
+    ['siteName','tagline','formUrl','regOpen'].forEach(k => { if (data[k] !== undefined) state[k] = data[k]; });
+  } else if (id === 'live'){
+    state.live = (data && data.started !== undefined) ? data : null;
+  } else if (id.startsWith('t:')){
+    const tid = id.slice(2), i = state.tournaments.findIndex(t => t.id === tid);
+    if (i >= 0) state.tournaments[i] = data; else state.tournaments.push(data);
+  }
+}
+function removeDoc(id){
+  if (id.startsWith('t:')){ const tid = id.slice(2); state.tournaments = state.tournaments.filter(t => t.id !== tid); }
+  if (id === 'live') state.live = null;
+}
+function cacheLocal(){ try{ const raw = JSON.stringify(state); localStorage.setItem(LS_KEY, raw); lastRaw = raw; }catch(e){} }
+
+async function loadRemote(){
+  const { data, error } = await sb.from('docs').select('id,data');
+  if (error) throw error;
+  const keepAdmin = state.admin;
+  state.tournaments = []; state.live = null;
+  Object.keys(synced).forEach(k => delete synced[k]);
+  data.forEach(r => { applyDoc(r.id, r.data); synced[r.id] = canon(r.data); });
+  state.admin = keepAdmin && adminDevice;
+  remoteLoaded = true; syncFailed = false;
+  cacheLocal();
+}
+
+function queueSync(){
+  if (syncQueued) return;
+  syncQueued = true;
+  syncChain = syncChain.then(async () => {
+    syncQueued = false;
+    if (!remoteLoaded) return;              // nunca subir antes de haber leído lo que hay
+    const docs = toDocs(state);
+    const up = Object.keys(docs).filter(k => docs[k] !== synced[k]);
+    const del = Object.keys(synced).filter(k => k.startsWith('t:') && !(k in docs));
+    if (!up.length && !del.length) return;
+    setSyncState('saving');
+    try{
+      if (up.length){
+        const rows = up.map(k => ({ id:k, data:JSON.parse(docs[k]) }));
+        up.forEach(k => { (sentRecent[k] = sentRecent[k] || []).push(docs[k]); if (sentRecent[k].length > 30) sentRecent[k].shift(); });
+        const { error } = await sb.from('docs').upsert(rows);
+        if (error) throw error;
+        up.forEach(k => synced[k] = docs[k]);
+      }
+      if (del.length){
+        const { error } = await sb.from('docs').delete().in('id', del);
+        if (error) throw error;
+        del.forEach(k => delete synced[k]);
+      }
+      syncFailed = false; setSyncState('ok');
+    }catch(e){
+      console.error('[liga] sync', e);
+      syncFailed = true; setSyncState('error');
+      toast('No se pudo guardar en el servidor. Revisá la conexión.', true);
+    }
+  });
+}
+
+function onRemoteChange(payload){
+  const ev = payload.eventType;
+  if (ev === 'DELETE'){
+    const id = payload.old && payload.old.id; if (!id) return;
+    if (!(id in synced)) return;
+    delete synced[id]; removeDoc(id);
+  } else {
+    const id = payload.new.id, raw = canon(payload.new.data);
+    if ((sentRecent[id] || []).includes(raw)) { synced[id] = synced[id] || raw; return; } // eco de lo que mandé yo
+    if (synced[id] === raw) return;
+    synced[id] = raw; applyDoc(id, payload.new.data);
+  }
+  cacheLocal();
+  const v = route().view;
+  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName) || modalRoot.innerHTML;
+  if (v === 'tv' || v === 'live' || !typing) render();
+}
+
+let syncStateVal = 'ok';
+function setSyncState(v){
+  syncStateVal = v;
+  const b = document.getElementById('banner'); if (!b) return;
+  b.className = 'banner admin-only' + (v === 'error' ? ' bad' : '');
+  b.textContent = !ONLINE ? 'Modo local · los datos se guardan solo en este navegador'
+    : v === 'saving' ? 'Guardando…'
+    : v === 'error' ? 'Sin conexión con el servidor: los últimos cambios no se guardaron'
+    : `Conectado como ${adminEmail || 'admin'} · los cambios se publican al instante`;
+}
+
+async function checkAdmin(){
+  if (!ONLINE) return;
+  const { data:{ session } } = await sb.auth.getSession();
+  if (!session){ adminDevice = false; adminEmail = ''; state.admin = false; return; }
+  const { data, error } = await sb.from('admins').select('user_id').eq('user_id', session.user.id).maybeSingle();
+  adminDevice = !error && !!data;
+  adminEmail = session.user.email || '';
+  state.admin = adminDevice;
+}
+let authChecked = !ONLINE;
+
+async function bootOnline(){
+  try{ await checkAdmin(); }catch(e){ console.error('[liga] auth', e); }
+  authChecked = true;
+  try{ await loadRemote(); }
+  catch(e){ console.error('[liga] load', e); toast('No se pudo conectar con el servidor. Mostrando la última copia guardada.', true); }
+  setSyncState(syncFailed ? 'error' : 'ok');
+  render();
+  sb.channel('docs-changes')
+    .on('postgres_changes', { event:'*', schema:'public', table:'docs' }, onRemoteChange)
+    .subscribe(status => {
+      // Al reconectar, volver a leer todo por si se perdió algún cambio
+      if (status === 'SUBSCRIBED' && remoteLoaded) loadRemote().then(render).catch(() => {});
+    });
+  sb.auth.onAuthStateChange((event) => {
+    if (event === 'SIGNED_OUT'){ adminDevice = false; adminEmail = ''; state.admin = false; render(); }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') loadRemote().then(render).catch(() => {});
+  });
+}
 const uid = () => Math.random().toString(36).slice(2,10);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clamp = (n,a,b) => Math.max(a, Math.min(b, n));
@@ -626,12 +798,14 @@ function render(){
   document.title = state.siteName || 'Liga de Pádel';
   document.getElementById('admin-toggle').checked = !!state.admin;
   const r = route();
-  if (r.view === 'admin'){
+  if (r.view === 'admin' && !ONLINE){
     try{ localStorage.setItem(ADMIN_KEY, '1'); }catch(e){}
     adminDevice = true; state.admin = true; save();
     location.hash = '#/torneos'; toast('Modo admin activado en este navegador'); return;
   }
+  if (r.view === 'admin' && adminDevice){ location.hash = '#/torneos'; return; }
   document.body.classList.toggle('admin-device', adminDevice);
+  setSyncState(syncStateVal);
   document.body.classList.toggle('landing-mode', r.view === 'landing');
   const cta = document.getElementById('nav-cta');
   cta.href = state.formUrl || DEFAULT_FORM;
@@ -645,13 +819,49 @@ function render(){
   nav.className = 'nav-link admin-only' + (r.view === 'live' ? ' on' : '');
   nav.innerHTML = (liveOn ? '<span class="live-dot"></span>' : '') + 'Marcador';
   keepAwake(r.view === 'live' && liveOn);
-  if (r.view === 'live'){ renderLive(); return; }
+  if (!authChecked && (r.view === 'admin' || r.view === 'live')){ app.innerHTML = '<p class="muted" style="text-align:center;padding:60px 0">Cargando…</p>'; return; }
+  if (r.view === 'admin'){ renderLogin(); return; }
+  if (r.view === 'live'){ if (!adminDevice){ location.hash = '#/admin'; return; } renderLive(); return; }
   if (r.view === 't'){
     const t = state.tournaments.find(x => x.id === r.id);
     if (!t){ location.hash = '#/torneos'; return; }
     renderTournament(t, r.tab);
   } else if (r.view === 'home') renderHome();
   else renderLanding();
+}
+
+/* ============ Ingreso de administradores ============ */
+function renderLogin(){
+  app.innerHTML = `<div class="login-wrap"><form class="card section form login" data-form="login">
+    <div><h1>Ingreso admin</h1><p class="muted">Solo para la organización. El público no necesita cuenta.</p></div>
+    <div class="field"><label for="lg-email">Email</label><input class="input" id="lg-email" type="email" autocomplete="username" required></div>
+    <div class="field"><label for="lg-pass">Contraseña</label><input class="input" id="lg-pass" type="password" autocomplete="current-password" required></div>
+    <div class="err" id="err" style="margin:0"></div>
+    <button class="btn primary" type="submit">Entrar</button>
+    <a class="muted small" href="#/">← Volver a la portada</a>
+  </form></div>`;
+}
+async function doLogin(f){
+  const err = f.querySelector('#err'), btn = f.querySelector('button[type=submit]');
+  err.textContent = ''; btn.disabled = true; btn.textContent = 'Entrando…';
+  try{
+    const { error } = await sb.auth.signInWithPassword({ email:f.querySelector('#lg-email').value.trim(), password:f.querySelector('#lg-pass').value });
+    if (error) throw error;
+    await checkAdmin();
+    if (!adminDevice){
+      await sb.auth.signOut();
+      err.textContent = 'Este usuario no tiene permisos de administrador.';
+      return;
+    }
+    state.admin = true;
+    await loadRemote();
+    location.hash = '#/torneos';
+    toast('Sesión iniciada');
+  }catch(e){
+    err.textContent = /invalid/i.test(e.message || '') ? 'Email o contraseña incorrectos.' : 'No se pudo iniciar sesión: ' + (e.message || e);
+  }finally{
+    btn.disabled = false; btn.textContent = 'Entrar';
+  }
 }
 
 /* ============ Portada (landing) ============ */
@@ -813,7 +1023,7 @@ function renderHome(){
           <button class="btn sm" data-action="export">Exportar respaldo</button>
           <button class="btn sm" data-action="import">Importar respaldo</button>
           <button class="btn sm danger" data-action="wipe">Borrar todo</button>
-          <button class="btn sm" data-action="admin-off">Quitar admin de este navegador</button>
+          <button class="btn sm" data-action="admin-off">${ONLINE ? 'Cerrar sesión' : 'Quitar admin de este navegador'}</button>
         </div>
       </div>
     </details>`;
@@ -1616,10 +1826,10 @@ function syncFromStorage(){
   const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName) || modalRoot.innerHTML;
   if (v === 'tv' || v === 'live' || !typing) render();
 }
-window.addEventListener('storage', e => { if (e.key === LS_KEY) syncFromStorage(); });
+window.addEventListener('storage', e => { if (!ONLINE && e.key === LS_KEY) syncFromStorage(); });
 setInterval(() => {
   if (route().view !== 'tv') return;
-  syncFromStorage();
+  if (!ONLINE) syncFromStorage();
   const c = document.getElementById('tv-clock'); if (c) c.textContent = clockStr();
 }, 600);
 
@@ -1689,7 +1899,7 @@ function addDemo(){
 const actions = {
   'close': closeModal,
   'new-t': newTournamentModal,
-  'demo': addDemo,
+  'demo': () => { if (ONLINE && !confirm('El torneo de ejemplo se va a publicar en la web y lo va a ver cualquiera. ¿Seguir?')) return; addDemo(); },
   'ff': el => { fixtureFilter = el.dataset.v; render(); },
   'save-site': () => {
     const url = document.getElementById('form-in').value.trim();
@@ -1700,7 +1910,13 @@ const actions = {
     state.regOpen = document.getElementById('reg-in').checked;
     save(); render(); toast('Ajustes guardados');
   },
-  'admin-off': () => {
+  'admin-off': async () => {
+    if (ONLINE){
+      await syncChain;
+      await sb.auth.signOut();
+      adminDevice = false; adminEmail = ''; state.admin = false; cacheLocal();
+      location.hash = '#/'; render(); toast('Sesión cerrada'); return;
+    }
     if (!confirm('¿Quitar el modo admin de este navegador? Para volver a activarlo, entrá a /#/admin.')) return;
     try{ localStorage.removeItem(ADMIN_KEY); }catch(e){}
     adminDevice = false; state.admin = false; save(); location.hash = '#/'; render();
@@ -1823,15 +2039,15 @@ const actions = {
         try{
           const s = JSON.parse(txt);
           if (!Array.isArray(s.tournaments)) throw 0;
-          if (!confirm('Esto reemplaza todos los datos actuales. ¿Seguir?')) return;
-          state = s; if (!adminDevice) state.admin = false; save(); location.hash = '#/torneos'; render(); toast('Respaldo importado');
+          if (!confirm(ONLINE ? 'Esto reemplaza todos los torneos publicados en la web. ¿Seguir?' : 'Esto reemplaza todos los datos actuales. ¿Seguir?')) return;
+          const keepAdmin = state.admin; state = s; state.admin = keepAdmin && adminDevice; save(); location.hash = '#/torneos'; render(); toast('Respaldo importado');
         }catch(e){ toast('El archivo no es un respaldo válido', true); }
       });
     };
     inp.click();
   },
   'wipe': () => {
-    if (!confirm('¿Borrar todos los torneos de este navegador?')) return;
+    if (!confirm(ONLINE ? '¿Borrar TODOS los torneos de la web? No se puede deshacer.' : '¿Borrar todos los torneos de este navegador?')) return;
     state.tournaments = []; save(); render(); toast('Datos borrados');
   }
 };
@@ -1848,6 +2064,7 @@ document.addEventListener('submit', e => {
   const kind = f.dataset.form;
   if (kind === 'res' || kind === 'sched') return; // los maneja cada modal
   e.preventDefault();
+  if (kind === 'login'){ doLogin(f); return; }
   if (kind === 'live-setup'){ startLive(f); return; }
   const v = readTournamentFields(f);
   if (!v.name){ const err = f.querySelector('#err'); if (err) err.textContent = 'Poné un nombre al torneo.'; else toast('Poné un nombre al torneo', true); return; }
@@ -1891,6 +2108,7 @@ document.addEventListener('change', e => {
 window.addEventListener('hashchange', () => { closeModal(); render(); window.scrollTo(0,0); });
 if (!location.hash) location.hash = '#/';
 render();
+if (ONLINE) bootOnline();
 </script>
 </body>
 </html>
